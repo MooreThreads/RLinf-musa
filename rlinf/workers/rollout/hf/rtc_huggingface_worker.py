@@ -47,6 +47,12 @@ class RTCMultiStepRolloutWorker(MultiStepRolloutWorker):
         self.inject_delay_ms = float(rtc_cfg.get("inject_delay_ms", 0.0))
         self.fixed_delay_steps = int(rtc_cfg.get("fixed_delay_steps", 0))
         self.eval_chunk_pause_seconds = float(rtc_cfg.get("chunk_pause_seconds", 0.0))
+        guided_action_indices = rtc_cfg.get("guided_action_indices", None)
+        self.rtc_guided_action_indices = (
+            None
+            if guided_action_indices is None
+            else tuple(int(index) for index in guided_action_indices)
+        )
 
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         """Serve RTC requests until the env worker sends an explicit stop."""
@@ -90,6 +96,7 @@ class RTCMultiStepRolloutWorker(MultiStepRolloutWorker):
                 prev_model_actions=self._rtc_eval_model_actions,
                 executed_horizon=rtc_request.executed_horizon,
                 delay_steps=rtc_request.predicted_delay_steps,
+                guided_action_indices=self.rtc_guided_action_indices,
             )
             guidance_applied = True
 

@@ -146,6 +146,9 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
             rtc_guidance_clip=float(
                 OmegaConf.select(model_cfg, "rtc_guidance_clip", default=5.0)
             ),
+            rtc_guidance_weight=float(
+                OmegaConf.select(model_cfg, "rtc_guidance_weight", default=5.0)
+            ),
         )
         _install_transforms(model, cfg, config_name)
     elif task == "rl":

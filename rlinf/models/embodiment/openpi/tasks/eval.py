@@ -42,6 +42,7 @@ class Pi0Eval(EnvIO, Pi0):
         rtc_enabled: bool = False,
         rtc_guidance_mode: str = "approx",
         rtc_guidance_clip: float = 5.0,
+        rtc_guidance_weight: float = 5.0,
     ):
         super().__init__(
             config,
@@ -55,6 +56,7 @@ class Pi0Eval(EnvIO, Pi0):
         self.rtc_enabled = rtc_enabled
         self.rtc_guidance_mode = rtc_guidance_mode
         self.rtc_guidance_clip = rtc_guidance_clip
+        self.rtc_guidance_weight = rtc_guidance_weight
 
     @torch.no_grad()
     def predict_action_batch(
@@ -76,7 +78,7 @@ class Pi0Eval(EnvIO, Pi0):
             )
         observation = self.env_obs_to_observation(env_obs)
         if rtc_context is not None and self.rtc_enabled:
-            if self.rtc_guidance_mode != "approx":
+            if self.rtc_guidance_mode not in {"approx", "vjp"}:
                 raise NotImplementedError(
                     f"Unsupported RTC guidance mode: {self.rtc_guidance_mode!r}"
                 )
@@ -95,17 +97,29 @@ class Pi0Eval(EnvIO, Pi0):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
             sample_actions_with_rtc_guidance,
+            sample_actions_with_vjp_rtc_guidance,
         )
 
-        model_actions = sample_actions_with_rtc_guidance(
-            self,
-            observation,
-            rtc_context,
-            num_steps=self.num_steps,
-            noise=noise,
-            rng=rng,
-            guidance_clip=self.rtc_guidance_clip,
-        )
+        if self.rtc_guidance_mode == "vjp":
+            model_actions = sample_actions_with_vjp_rtc_guidance(
+                self,
+                observation,
+                rtc_context,
+                num_steps=self.num_steps,
+                noise=noise,
+                rng=rng,
+                guidance_weight=self.rtc_guidance_weight,
+            )
+        else:
+            model_actions = sample_actions_with_rtc_guidance(
+                self,
+                observation,
+                rtc_context,
+                num_steps=self.num_steps,
+                noise=noise,
+                rng=rng,
+                guidance_clip=self.rtc_guidance_clip,
+            )
         actions = self.decode_actions(model_actions, observation.state)
         B = actions.shape[0]
         return actions, {

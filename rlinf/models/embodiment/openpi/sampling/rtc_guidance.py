@@ -37,6 +37,7 @@ class RTCGuidanceContext:
     prev_model_actions: torch.Tensor | None = None  # [B, H, A_model]
     executed_horizon: int = 0
     delay_steps: int = 0
+    guided_action_indices: tuple[int, ...] | None = None
 
     def get_prev_remaining(self) -> torch.Tensor | None:
         if self.prev_model_actions is None:
@@ -47,6 +48,25 @@ class RTCGuidanceContext:
         return self.prev_model_actions[:, executed_horizon:, :]
 
 
+def _rtc_guidance_weight_at_time(
+    time_value: torch.Tensor, max_guidance_weight: float
+) -> float:
+    """Return the guidance weight for one denoising step.
+
+    The schedule is U-shaped: it is capped at ``max_guidance_weight`` near
+    both ends of the trajectory and reaches its minimum at the midpoint.
+    """
+    time_float = float(time_value.detach().item())
+    tau = 1.0 - time_float
+    if tau <= 0.0:
+        return float(max_guidance_weight)
+    if time_float <= 0.0:
+        return 0.0
+    inverse_r_squared = (time_float**2 + tau**2) / (time_float**2)
+    guidance = (time_float / tau) * inverse_r_squared
+    return min(float(max_guidance_weight), float(guidance))
+
+
 def build_rtc_target_and_mask(
     prev_remaining: torch.Tensor | None,
     horizon: int,
@@ -54,11 +74,18 @@ def build_rtc_target_and_mask(
     delay_steps: int,
     device: torch.device,
     dtype: torch.dtype,
+    guided_action_indices: tuple[int, ...] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build overlap target and soft mask in model action space."""
+    """Build the overlap target and a soft per-dimension guidance mask.
+
+    The delay prefix is stale by the time the new chunk returns, so it is left
+    unguided. The still-relevant overlap decays with a squared cosine from one
+    to zero. ``guided_action_indices`` restricts guidance to selected action
+    dimensions; out-of-range indices are ignored.
+    """
     batch_size = 1 if prev_remaining is None else prev_remaining.shape[0]
     target = torch.zeros((batch_size, horizon, action_dim), device=device, dtype=dtype)
-    mask = torch.zeros((batch_size, horizon, 1), device=device, dtype=dtype)
+    mask = torch.zeros((batch_size, horizon, action_dim), device=device, dtype=dtype)
 
     if prev_remaining is None or prev_remaining.numel() == 0:
         return target, mask
@@ -68,19 +95,27 @@ def build_rtc_target_and_mask(
         return target, mask
 
     target[:, :overlap] = prev_remaining[:, :overlap].to(device=device, dtype=dtype)
-    hard_end = min(max(int(delay_steps), 0), overlap)
-    if hard_end > 0:
-        # Actions that are likely to be executed before the new chunk arrives
-        # are treated as hard constraints.
-        mask[:, :hard_end, 0] = 1.0
-    if hard_end < overlap:
-        # Later overlap positions are softly guided so the new plan can still
-        # adapt to the latest camera observation.
-        i = torch.arange(hard_end, overlap, device=device, dtype=dtype)
-        denom = max(float(overlap - hard_end + 1), 1.0)
-        c_i = (overlap - i) / denom
-        soft = c_i * (torch.expm1(c_i) / (math.e - 1.0))
-        mask[:, hard_end:overlap, 0] = soft
+    soft_start = min(max(int(delay_steps), 0), overlap)
+    if soft_start >= overlap:
+        return target, mask
+
+    soft_length = overlap - soft_start
+    ramp = torch.linspace(0.0, 1.0, soft_length, device=device, dtype=dtype)
+    soft = torch.cos(0.5 * math.pi * ramp).square()
+
+    dimension_mask = torch.zeros((action_dim,), device=device, dtype=dtype)
+    if guided_action_indices is None:
+        dimension_mask.fill_(1.0)
+    else:
+        valid_indices = [
+            int(index)
+            for index in guided_action_indices
+            if 0 <= int(index) < action_dim
+        ]
+        if valid_indices:
+            dimension_mask[valid_indices] = 1.0
+
+    mask[:, soft_start:overlap, :] = soft[None, :, None] * dimension_mask[None, None, :]
     return target, mask
 
 
@@ -124,6 +159,9 @@ def sample_actions_with_rtc_guidance(
         delay_steps=0 if rtc_context is None else rtc_context.delay_steps,
         device=device,
         dtype=noise.dtype,
+        guided_action_indices=(
+            None if rtc_context is None else rtc_context.guided_action_indices
+        ),
     )
 
     x_t = noise
@@ -159,4 +197,90 @@ def sample_actions_with_rtc_guidance(
         )
         x_t = x_t_mean + step_noise * x_t_std
         paper_tau = paper_tau + dt
+    return x_t
+
+
+@torch.no_grad()
+def sample_actions_with_vjp_rtc_guidance(
+    pi0_model,
+    observation,
+    rtc_context: RTCGuidanceContext,
+    *,
+    num_steps: int,
+    noise: torch.Tensor | None = None,
+    rng: torch.Generator | None = None,
+    guidance_weight: float = 5.0,
+) -> torch.Tensor:
+    """Euler ODE sampling with VJP guidance on the denoised action estimate.
+
+    The guidance weight follows the NERO RTC schedule instead of staying
+    constant across denoising steps.
+    """
+    observation = preprocess_observation(observation, train=False)
+    batch_size = observation.state.shape[0]
+    device = observation.state.device
+    if noise is None:
+        noise = torch.randn(
+            batch_size,
+            pi0_model.action_horizon,
+            pi0_model.action_dim,
+            device=device,
+            dtype=torch.float32,
+            generator=rng,
+        )
+    else:
+        noise = noise.to(device=device, dtype=torch.float32)
+
+    with torch.no_grad():
+        _, prefix_mask, kv_cache = pi0_model.build_prefix_cache(observation)
+
+    prev_remaining = rtc_context.get_prev_remaining()
+    target, mask = build_rtc_target_and_mask(
+        prev_remaining=prev_remaining,
+        horizon=pi0_model.action_horizon,
+        action_dim=pi0_model.action_dim,
+        delay_steps=rtc_context.delay_steps,
+        device=device,
+        dtype=noise.dtype,
+        guided_action_indices=rtc_context.guided_action_indices,
+    )
+    has_guidance = bool(torch.count_nonzero(mask).item())
+    max_guidance_weight = float(guidance_weight)
+    runtime_guidance_weights: list[float] = []
+
+    x_t = noise
+    timesteps = rl_sampler.get_timesteps(num_steps, device)
+    for index in range(num_steps):
+        t = timesteps[index]
+        t_batch = t.expand(batch_size)
+        dt = timesteps[index + 1] - t
+        step_guidance_weight = _rtc_guidance_weight_at_time(t, max_guidance_weight)
+        runtime_guidance_weights.append(step_guidance_weight)
+
+        with torch.enable_grad():
+            x_var = x_t.detach().requires_grad_(has_guidance)
+            suffix_output = pi0_model.run_suffix(
+                observation,
+                x_var,
+                t_batch,
+                kv_cache,
+                prefix_mask,
+            )
+            velocity = pi0_model.velocity_from_suffix(suffix_output).to(torch.float32)
+
+            if has_guidance:
+                denoised = x_var - t_batch[:, None, None] * velocity
+                weighted_error = (target - denoised) * mask
+                correction = torch.autograd.grad(
+                    outputs=denoised,
+                    inputs=x_var,
+                    grad_outputs=weighted_error,
+                    retain_graph=False,
+                    create_graph=False,
+                )[0]
+                velocity = velocity - step_guidance_weight * correction
+
+        x_t = (x_var + dt * velocity).detach()
+
+    pi0_model._last_rtc_guidance_weights = runtime_guidance_weights
     return x_t

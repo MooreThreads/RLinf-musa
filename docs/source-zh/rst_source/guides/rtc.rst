@@ -17,11 +17,12 @@ RTC 的核心思想是将策略推理与动作执行流水线化。标准 rollou
 3. **延迟自适应**：RTC 维护一个滑动窗口（``delay_buffer_size``）记录实际观测到的推理延迟，用于预测下一轮请求时机。
 4. **停止**：episode 结束（或达到最大步数）后，Env Worker 发送 ``stop`` 信号终止 Rollout Worker 循环。
 
-RTC 使用 ``软重叠引导``\ （soft overlap guidance）来平滑 chunk 边界。当新 chunk 到达时，前一个 chunk 可能还有若干步未执行。RTC 引导机制使新 chunk 的前 ``delay_steps`` 步与旧 chunk 的剩余部分保持一致，避免动作突变：
+RTC 使用 ``软重叠引导``\ （soft overlap guidance）来平滑 chunk 边界。当新 chunk 到达时，前一个 chunk 可能还有若干步未执行。RTC 引导机制将新 chunk 中仍然相关的部分与旧 chunk 的剩余动作对齐，避免动作突变：
 
-- ``硬掩码`` （hard mask）：前 ``delay_steps`` 步，强制使用旧 chunk 的剩余动作。
-- ``软掩码`` （soft mask）：后续若干步，通过指数衰减引导新 chunk 逐渐过渡到其自身预测。
-- 引导强度由 ``rtc_guidance_clip`` 限制，避免过度修正。
+- 延迟前缀（``delay_steps``）在新 chunk 返回时已经过期，因此不做引导。
+- 其余重叠部分按平方余弦从 1 衰减到 0，向旧 chunk 的剩余动作引导。
+- ``runner.rtc.guided_action_indices`` 可以把引导限制在选定的动作维度上；超出范围的索引会被忽略。
+- 提供两种引导模式：``"approx"``（默认）用 ``rtc_guidance_clip`` 裁剪引导强度；``"vjp"`` 使用去噪动作估计的梯度，并按去噪步施加由 ``rtc_guidance_weight`` 封顶的 U 形权重。
 
 仿真实验
 --------
@@ -294,6 +295,9 @@ RTC 参数分布在两个位置：
    * - ``delay_buffer_size``
      - ``8``
      - 滑动窗口大小，用于估计推理延迟。RTC 使用窗口内的最大延迟步数作为下一轮预测值。
+   * - ``guided_action_indices``
+     - ``None``
+     - 可选的动作维度列表，仅引导这些维度。未设置时引导所有维度；超出范围的索引会被忽略。
 
 ``model.openpi.rtc_*`` （控制 RTC 引导行为，建议与 ``runner.rtc.enabled`` 保持同步）
 
@@ -309,7 +313,10 @@ RTC 参数分布在两个位置：
      - 建议使用 Hydra 引用 ``${runner.rtc.enabled}`` 保持同步。启用后模型输出 action chunk 时会参考前一 chunk 的剩余动作。
    * - ``rtc_guidance_mode``
      - ``"approx"``
-     - 引导模式，当前仅支持 ``"approx"`` （近似引导）。
+     - 引导模式：``"approx"``（近似引导）或 ``"vjp"``（使用去噪动作估计梯度的向量-雅可比积引导）。
    * - ``rtc_guidance_clip``
      - ``5.0``
-     - 引导强度裁剪阈值。值越大引导越强，chunk 边界越平滑；过大可能导致动作偏离。推荐范围 3.0-10.0。
+     - 近似引导的强度裁剪阈值。值越大引导越强，chunk 边界越平滑；过大可能导致动作偏离。推荐范围 3.0-10.0。
+   * - ``rtc_guidance_weight``
+     - ``5.0``
+     - VJP 引导权重的上限。权重按去噪步呈 U 形调度，并被裁剪到该值。值越大引导越强；过大可能导致动作偏离。

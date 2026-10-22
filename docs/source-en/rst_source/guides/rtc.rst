@@ -17,11 +17,12 @@ Process:
 3. **Adaptive latency**: RTC maintains a sliding window (``delay_buffer_size``) recording observed inference latency, used to predict when to send the next request.
 4. **Stop**: Once the episode ends (or max steps reached), the Env Worker sends a ``stop`` signal to terminate the Rollout Worker loop.
 
-RTC uses **soft overlap guidance** to smooth chunk boundaries. When a new chunk arrives, the previous chunk may still have several unexecuted steps. The RTC guidance mechanism aligns the first ``delay_steps`` of the new chunk with the remaining steps of the old chunk, avoiding abrupt action changes:
+RTC uses **soft overlap guidance** to smooth chunk boundaries. When a new chunk arrives, the previous chunk may still have several unexecuted steps. The RTC guidance mechanism aligns the still-relevant part of the new chunk with the remaining steps of the old chunk, avoiding abrupt action changes:
 
-- **Hard mask**: the first ``delay_steps`` positions, forced to match the old chunk's remaining actions.
-- **Soft mask**: subsequent steps, guided toward the new chunk's predictions with exponential decay.
-- Guidance strength is clipped by ``rtc_guidance_clip`` to avoid over-correction.
+- The delay prefix (``delay_steps``) is stale by the time the new chunk arrives, so it is left unguided.
+- The remaining overlap is guided toward the old chunk's remaining actions with a squared-cosine decay from one to zero.
+- ``runner.rtc.guided_action_indices`` can restrict guidance to selected action dimensions; out-of-range indices are ignored.
+- Two guidance modes are available: ``"approx"`` (default) clips the guidance strength with ``rtc_guidance_clip``; ``"vjp"`` uses the gradient of the denoised action estimate with a U-shaped per-step weight capped by ``rtc_guidance_weight``.
 
 Simulation Experiment
 ---------------------
@@ -294,6 +295,9 @@ RTC parameters are split across two locations:
    * - ``delay_buffer_size``
      - ``8``
      - Sliding window size for estimating inference latency. RTC uses the maximum delay in the window as the next round's prediction.
+   * - ``guided_action_indices``
+     - ``None``
+     - Optional list of action dimensions to guide. When unset, all dimensions are guided. Out-of-range indices are ignored.
 
 ``model.openpi.rtc_*`` (controls RTC guidance behavior; keep in sync with ``runner.rtc.enabled``)
 
@@ -309,7 +313,10 @@ RTC parameters are split across two locations:
      - Use Hydra reference ``${runner.rtc.enabled}`` to keep in sync. When enabled, the model's output action chunk references the previous chunk's remaining actions.
    * - ``rtc_guidance_mode``
      - ``"approx"``
-     - Guidance mode, currently only ``"approx"`` (approximate guidance) is supported.
+     - Guidance mode: ``"approx"`` (approximate guidance) or ``"vjp"`` (vector-Jacobian product guidance using the gradient of the denoised action estimate).
    * - ``rtc_guidance_clip``
      - ``5.0``
-     - Guidance strength clipping threshold. Higher values mean stronger guidance and smoother chunk boundaries; too high may cause action drift. Recommended range 3.0-10.0.
+     - Approximate-guidance strength clipping threshold. Higher values mean stronger guidance and smoother chunk boundaries; too high may cause action drift. Recommended range 3.0-10.0.
+   * - ``rtc_guidance_weight``
+     - ``5.0``
+     - VJP-guidance weight upper bound. The weight follows a U-shaped schedule over the denoising steps and is capped at this value. Higher values mean stronger guidance; too high may cause action drift.
